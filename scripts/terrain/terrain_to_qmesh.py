@@ -378,7 +378,8 @@ def prepare(args):
     }
     qmesh.write_layer_json(
         terrain_dir, args.max_zoom, per_level, args.min_zoom,
-        bounds=bbox, output_minzoom=args.min_zoom, metadata=metadata)
+        bounds=bbox, output_minzoom=args.min_zoom, metadata=metadata,
+        merge_existing=False)
     incomplete.unlink(missing_ok=True)
     print('complete: %s (%s)' % (package_dir, counts), flush=True)
 

@@ -357,15 +357,16 @@ def availability(per_level, maxzoom):
 
 
 def write_layer_json(out_dir, maxzoom, per_level, min_zoom, bounds=None,
-                     output_minzoom=None, metadata=None):
-    """Write layer.json. For an upgrade run (min_zoom > 0) availability is merged into
-    the existing tileset so the base levels are kept (Cesium ORs the rectangle lists).
-    A full run (min_zoom == 0) writes fresh availability so it never advertises stale
-    tiles from a previous build."""
+                     output_minzoom=None, metadata=None, merge_existing=True):
+    """Write layer.json.
+
+    SRTM upgrade runs merge existing availability. Regional packages pass
+    merge_existing=False so a rebuild cannot advertise stale tiles.
+    """
     path = os.path.join(out_dir, 'layer.json')
     new_avail = availability(per_level, maxzoom)
     old_avail, old_max = [], -1
-    if min_zoom > 0 and os.path.exists(path):
+    if merge_existing and min_zoom > 0 and os.path.exists(path):
         try:
             old = json.load(open(path))
             old_avail = old.get('available', [])

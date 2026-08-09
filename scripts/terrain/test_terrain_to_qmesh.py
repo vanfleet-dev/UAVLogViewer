@@ -50,6 +50,23 @@ def test_layer_json_records_regional_contract(tmp_path):
     assert layer['available'][18]
 
 
+def test_regional_layer_does_not_merge_stale_availability(tmp_path):
+    qmesh.write_layer_json(
+        str(tmp_path), 18, {18: [(10, 20)]}, 18,
+        bounds=[1.0, 2.0, 3.0, 4.0], output_minzoom=18,
+        merge_existing=False)
+    qmesh.write_layer_json(
+        str(tmp_path), 18, {18: [(30, 40)]}, 18,
+        bounds=[5.0, 6.0, 7.0, 8.0], output_minzoom=18,
+        merge_existing=False)
+
+    layer = json.loads((tmp_path / 'layer.json').read_text())
+
+    assert layer['bounds'] == [5.0, 6.0, 7.0, 8.0]
+    assert layer['available'][18] == [
+        {'startX': 30, 'startY': 40, 'endX': 30, 'endY': 40}]
+
+
 def test_latest_product_is_selected_for_each_usgs_tile():
     products = [
         _product('old x47y443', '2022-02-10', 'https://example/old.tif', 10),
