@@ -45,8 +45,8 @@ records USGS NAVD88 metadata but does not perform a vertical conversion.
     --out /data/terrain/site-name --jobs 4
 ```
 
-The output contains `layer.json`, `sources.json`, `_source.tif`, the downloaded
-source GeoTIFFs under `sources/`, and `{z}/{x}/{y}.terrain`. A `.incomplete`
+The output contains `region.json`, `terrain/layer.json`, `_source.tif`, the downloaded
+source GeoTIFFs under `sources/`, and `terrain/{z}/{x}/{y}.terrain`. A `.incomplete`
 marker remains if preparation fails or is interrupted; `layer.json` is written
 only after all advertised terrain tiles exist. The tool refuses a requested
 area with substantial no-data coverage rather than publishing zero-height

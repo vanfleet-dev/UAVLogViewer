@@ -2,7 +2,10 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 import pytest
+import rasterio
+from rasterio.transform import from_bounds
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPT_DIR))
@@ -77,6 +80,33 @@ def test_product_selection_falls_back_when_newest_has_no_data():
 def test_rejects_invalid_bbox_order():
     with pytest.raises(ValueError, match='WEST < EAST'):
         terrain.validate_bbox([-105.0, 40.0, -106.0, 41.0])
+
+
+def test_local_raster_build_publishes_regional_package(tmp_path):
+    source = tmp_path / 'source.tif'
+    bbox = [-105.001, 39.999, -104.999, 40.001]
+    with rasterio.open(
+            source, 'w', driver='GTiff', width=256, height=256, count=1,
+            dtype='float32', crs='EPSG:4326', nodata=-32768.0,
+            transform=from_bounds(*bbox, 256, 256)) as dataset:
+        dataset.write(np.full((256, 256), 1234.5, dtype=np.float32), 1)
+    package = tmp_path / 'package'
+    args = terrain.parse_args([
+        '--source-raster', str(source),
+        '--bbox', *(str(value) for value in bbox),
+        '--min-zoom', '13', '--max-zoom', '13',
+        '--out', str(package), '--jobs', '1',
+    ])
+
+    terrain.prepare(args)
+
+    region = json.loads((package / 'region.json').read_text())
+    assert region['schemaVersion'] == 1
+    assert region['terrain']['path'] == 'terrain/layer.json'
+    assert region['terrain']['renderCounts']['ok'] == 1
+    assert (package / 'terrain' / 'layer.json').is_file()
+    assert len(list((package / 'terrain' / '13').glob('*/*.terrain'))) == 1
+    assert not (package / '.incomplete').exists()
 
 
 def _product(title, publication_date, url, size):

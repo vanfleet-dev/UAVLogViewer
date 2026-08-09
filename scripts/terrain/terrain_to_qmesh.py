@@ -11,6 +11,7 @@ datum conversion.
 import argparse
 from contextlib import ExitStack
 from concurrent.futures import ProcessPoolExecutor
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -290,16 +291,26 @@ def prepare(args):
     if args.min_zoom < 0 or args.max_zoom > 19 or args.min_zoom > args.max_zoom:
         raise ValueError('zoom range must satisfy 0 <= MIN <= MAX <= 19')
 
-    out_dir = Path(args.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
-    incomplete = out_dir / '.incomplete'
+    package_dir = Path(args.out).resolve()
+    terrain_dir = package_dir / 'terrain'
+    package_dir.mkdir(parents=True, exist_ok=True)
+    terrain_dir.mkdir(exist_ok=True)
+    incomplete = package_dir / '.incomplete'
     incomplete.write_text('terrain package build in progress\n')
 
     manifest = {
+        'schemaVersion': 1,
+        'builtAt': datetime.now(timezone.utc).isoformat(),
+        'converter': {
+            'file': Path(__file__).name,
+            'sha256': sha256_file(Path(__file__)),
+        },
         'dataset': USGS_1M_DATASET if args.usgs_1m else 'local raster',
-        'requestedBounds': bbox,
+        'operationalAOI': bbox,
         'elevationReference': (USGS_ELEVATION_REFERENCE if args.usgs_1m
                                else args.elevation_reference),
+        'verticalValuesTransformed': False,
+        'nodataPolicy': 'refuse package when sampled AOI validity is below 99 percent',
         'productsQuery': None,
         'products': [],
         'sourceRasters': [],
@@ -313,7 +324,7 @@ def prepare(args):
             raise RuntimeError('%d USGS tiles exceed --max-products %d' %
                                (len(products), args.max_products))
         print('USGS products selected: %d' % len(products), flush=True)
-        download_dir = out_dir / 'sources'
+        download_dir = package_dir / 'sources'
         download_dir.mkdir(exist_ok=True)
         source_paths = []
         records = []
@@ -334,7 +345,8 @@ def prepare(args):
     last_bounds = qmesh.tile_bounds(args.max_zoom, x1, y1)
     mosaic_bounds = [first_bounds[0], first_bounds[1],
                      last_bounds[2], last_bounds[3]]
-    mosaic_path = out_dir / '_source.tif'
+    manifest['preparedBounds'] = mosaic_bounds
+    mosaic_path = package_dir / '_source.tif'
     source_records, mosaic_record = build_mosaic(
         source_paths, mosaic_path, mosaic_bounds)
     manifest['sourceRasters'] = source_records
@@ -342,27 +354,33 @@ def prepare(args):
     valid_fraction = mosaic_valid_fraction(mosaic_path, bbox)
     manifest['mosaic']['requestedBoundsValidFraction'] = valid_fraction
     if valid_fraction < 0.99:
-        atomic_json(out_dir / 'sources.json', manifest)
+        atomic_json(package_dir / 'region.json', manifest)
         raise RuntimeError(
             'source data covers only %.1f%% of the requested bbox; choose a smaller '
             'zone or another source raster' % (100.0 * valid_fraction))
-    atomic_json(out_dir / 'sources.json', manifest)
-
     per_level, counts = render_tiles(
-        mosaic_path, out_dir, bbox, args.min_zoom, args.max_zoom,
+        mosaic_path, terrain_dir, bbox, args.min_zoom, args.max_zoom,
         args.jobs, args.grid, args.max_error, args.tile_px, args.force)
+    manifest['terrain'] = {
+        'path': 'terrain/layer.json',
+        'minZoom': args.min_zoom,
+        'maxZoom': args.max_zoom,
+        'tileCounts': {str(zoom): len(per_level[zoom]) for zoom in per_level},
+        'renderCounts': counts,
+    }
+    atomic_json(package_dir / 'region.json', manifest)
     metadata = {
         'dataset': manifest['dataset'],
         'elevationReference': manifest['elevationReference'],
-        'sourceManifest': 'sources.json',
+        'sourceManifest': '../region.json',
         'sourceCRS': [record['crs'] for record in source_records],
         'tileCounts': {str(zoom): len(per_level[zoom]) for zoom in per_level},
     }
     qmesh.write_layer_json(
-        out_dir, args.max_zoom, per_level, args.min_zoom,
+        terrain_dir, args.max_zoom, per_level, args.min_zoom,
         bounds=bbox, output_minzoom=args.min_zoom, metadata=metadata)
     incomplete.unlink(missing_ok=True)
-    print('complete: %s (%s)' % (out_dir, counts), flush=True)
+    print('complete: %s (%s)' % (package_dir, counts), flush=True)
 
 
 def parse_args(argv=None):
