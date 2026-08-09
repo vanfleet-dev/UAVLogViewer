@@ -243,6 +243,24 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def response_identity(response):
+    headers = response.headers
+    content_length = headers.get('Content-Length')
+    return {
+        'contentLength': int(content_length) if content_length else None,
+        'contentType': headers.get('Content-Type'),
+        'etag': headers.get('ETag'),
+        'lastModified': headers.get('Last-Modified'),
+    }
+
+
+def remote_identity(url):
+    request = Request(
+        url, headers={'User-Agent': 'MAVProxy-terrain-prep/1'}, method='HEAD')
+    with urlopen(request, timeout=60) as response:
+        return response_identity(response)
+
+
 def download_product(product, download_dir, force=False):
     url = product['downloadURL']
     name = Path(unquote(urlparse(url).path)).name
@@ -250,7 +268,17 @@ def download_product(product, download_dir, force=False):
         raise RuntimeError('USGS product has no filename: %s' % url)
     path = download_dir / name
     expected_size = int(product.get('sizeInBytes') or 0)
-    if path.exists() and not force and (not expected_size or path.stat().st_size == expected_size):
+    identity = None
+    reuse = path.exists() and not force and (
+        not expected_size or path.stat().st_size == expected_size)
+    if path.exists() and not force and not reuse:
+        try:
+            identity = remote_identity(url)
+        except OSError:
+            identity = None
+        live_size = identity.get('contentLength') if identity else None
+        reuse = live_size is not None and path.stat().st_size == live_size
+    if reuse:
         print('reuse %s' % path, flush=True)
     else:
         part = path.with_suffix(path.suffix + '.part')
@@ -258,14 +286,25 @@ def download_product(product, download_dir, force=False):
         print('download %s' % url, flush=True)
         request = Request(url, headers={'User-Agent': 'MAVProxy-terrain-prep/1'})
         with urlopen(request, timeout=120) as response, open(part, 'wb') as output:
+            identity = response_identity(response)
             shutil.copyfileobj(response, output, length=1024 * 1024)
-        if expected_size and part.stat().st_size != expected_size:
+        downloaded_size = part.stat().st_size
+        live_size = identity['contentLength']
+        if live_size is not None and downloaded_size != live_size:
+            part.unlink(missing_ok=True)
+            raise RuntimeError('download size mismatch for %s' % url)
+        if live_size is None and expected_size and downloaded_size != expected_size:
             part.unlink(missing_ok=True)
             raise RuntimeError('download size mismatch for %s' % url)
         os.replace(part, path)
     record = dict(product)
     record['localFile'] = path.name
     record['downloadedBytes'] = path.stat().st_size
+    record['httpIdentity'] = identity
+    live_size = identity.get('contentLength') if identity else None
+    record['catalogLiveSizeDiscrepancyBytes'] = (
+        live_size - expected_size
+        if live_size is not None and expected_size else None)
     record['sha256'] = sha256_file(path)
     return path, record
 

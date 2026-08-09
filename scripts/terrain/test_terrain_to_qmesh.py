@@ -1,4 +1,5 @@
 import gzip
+import io
 import json
 import struct
 import sys
@@ -14,6 +15,12 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 import srtm_to_qmesh as qmesh
 import terrain_to_qmesh as terrain
+
+
+class FakeResponse(io.BytesIO):
+    def __init__(self, payload, headers):
+        super().__init__(payload)
+        self.headers = headers
 
 
 def test_bbox_worklist_contains_only_intersecting_tiles():
@@ -94,6 +101,75 @@ def test_product_selection_falls_back_when_newest_has_no_data():
         products, probe=lambda product: 'old.tif' in product['downloadURL'])
 
     assert [item['downloadURL'] for item in selected] == ['https://example/old.tif']
+
+
+def test_download_accepts_live_size_and_records_stale_catalog_size(tmp_path, monkeypatch):
+    payload = b'complete live object'
+    product = _product(
+        'one meter x28y383', '2026-03-20',
+        'https://example/terrain.tif', len(payload) - 2)
+
+    def fake_urlopen(request, timeout):
+        assert request.get_method() == 'GET'
+        assert timeout == 120
+        return FakeResponse(payload, {
+            'Content-Length': str(len(payload)),
+            'Content-Type': 'image/tiff',
+            'ETag': '"live-etag"',
+            'Last-Modified': 'Sun, 09 Aug 2026 18:46:10 GMT',
+        })
+
+    monkeypatch.setattr(terrain, 'urlopen', fake_urlopen)
+    path, record = terrain.download_product(product, tmp_path)
+
+    assert path.read_bytes() == payload
+    assert record['downloadedBytes'] == len(payload)
+    assert record['catalogLiveSizeDiscrepancyBytes'] == 2
+    assert record['httpIdentity'] == {
+        'contentLength': len(payload),
+        'contentType': 'image/tiff',
+        'etag': '"live-etag"',
+        'lastModified': 'Sun, 09 Aug 2026 18:46:10 GMT',
+    }
+
+
+def test_download_reuses_live_sized_file_when_catalog_size_is_stale(tmp_path, monkeypatch):
+    payload = b'previous complete live object'
+    product = _product(
+        'one meter x28y383', '2026-03-20',
+        'https://example/terrain.tif', len(payload) - 2)
+    (tmp_path / 'terrain.tif').write_bytes(payload)
+
+    def fake_urlopen(request, timeout):
+        assert request.get_method() == 'HEAD'
+        assert timeout == 60
+        return FakeResponse(b'', {'Content-Length': str(len(payload))})
+
+    monkeypatch.setattr(terrain, 'urlopen', fake_urlopen)
+    path, record = terrain.download_product(product, tmp_path)
+
+    assert path.read_bytes() == payload
+    assert record['downloadedBytes'] == len(payload)
+    assert record['catalogLiveSizeDiscrepancyBytes'] == 2
+    assert record['httpIdentity']['contentLength'] == len(payload)
+
+
+def test_download_rejects_incomplete_live_transfer(tmp_path, monkeypatch):
+    payload = b'incomplete'
+    product = _product(
+        'one meter x28y383', '2026-03-20',
+        'https://example/terrain.tif', len(payload))
+
+    def fake_urlopen(_request, timeout):
+        assert timeout == 120
+        return FakeResponse(payload, {'Content-Length': str(len(payload) + 1)})
+
+    monkeypatch.setattr(terrain, 'urlopen', fake_urlopen)
+
+    with pytest.raises(RuntimeError, match='download size mismatch'):
+        terrain.download_product(product, tmp_path)
+    assert not (tmp_path / 'terrain.tif').exists()
+    assert not (tmp_path / 'terrain.tif.part').exists()
 
 
 def test_rejects_invalid_bbox_order():
