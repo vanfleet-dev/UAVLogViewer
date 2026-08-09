@@ -307,6 +307,34 @@ def build_worklist(cells, minzoom, maxzoom, clip=None, want_levels=True):
     return keys, per_level
 
 
+def build_worklist_for_bbox(bbox, minzoom, maxzoom, want_levels=True):
+    """Build the sorted tile set for one geographic bbox without SRTM cells."""
+    w, s, e, n = bbox
+    parts = []
+    for z in range(minzoom, maxzoom + 1):
+        x0, x1, y0, y1 = tile_range_for_bbox(z, w, s, e, n)
+        if x1 < x0 or y1 < y0:
+            continue
+        xs = np.arange(x0, x1 + 1, dtype=np.int64)
+        ys = np.arange(y0, y1 + 1, dtype=np.int64)
+        parts.append(((np.int64(z) << _KEY_ZSH)
+                      | (xs[:, None] << _KEY_XSH)
+                      | ys[None, :]).ravel())
+    if not parts:
+        return np.empty(0, dtype=np.int64), ({} if want_levels else None)
+    keys = np.concatenate(parts)
+    per_level = None
+    if want_levels:
+        per_level = {}
+        zz = keys >> _KEY_ZSH
+        xx = (keys >> _KEY_XSH) & _KEY_MASK
+        yy = keys & _KEY_MASK
+        for z in range(minzoom, maxzoom + 1):
+            mask = zz == z
+            per_level[z] = list(zip(xx[mask].tolist(), yy[mask].tolist()))
+    return keys, per_level
+
+
 def availability(per_level, maxzoom):
     """Row-merge each level's (x,y) tiles into rectangles for layer.json."""
     out = []
@@ -328,7 +356,8 @@ def availability(per_level, maxzoom):
     return out
 
 
-def write_layer_json(out_dir, maxzoom, per_level, min_zoom):
+def write_layer_json(out_dir, maxzoom, per_level, min_zoom, bounds=None,
+                     output_minzoom=None, metadata=None):
     """Write layer.json. For an upgrade run (min_zoom > 0) availability is merged into
     the existing tileset so the base levels are kept (Cesium ORs the rectangle lists).
     A full run (min_zoom == 0) writes fresh availability so it never advertises stale
@@ -352,12 +381,18 @@ def write_layer_json(out_dir, maxzoom, per_level, min_zoom):
     layer = {
         'tilejson': '2.1.0', 'format': 'quantized-mesh-1.0', 'version': '1.0.0',
         'scheme': 'tms', 'projection': 'EPSG:4326',
-        'bounds': [-180, -90, 180, 90], 'minzoom': 0, 'maxzoom': final_max,
+        'bounds': list(bounds) if bounds is not None else [-180, -90, 180, 90],
+        'minzoom': 0 if output_minzoom is None else output_minzoom,
+        'maxzoom': final_max,
         'tiles': ['{z}/{x}/{y}.terrain'], 'extensions': ['octvertexnormals'],
         'available': merged,
     }
-    with open(path, 'w') as f:
+    if metadata is not None:
+        layer['metadata'] = metadata
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
         json.dump(layer, f)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------- main
