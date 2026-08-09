@@ -32,7 +32,7 @@ pip install -r requirements.txt   # rasterio wheel bundles GDAL; no apt needed
 ## Regional USGS 3DEP 1 m package
 
 `terrain_to_qmesh.py` is the internal preparation path for a bounded Map3D
-terrain package. It queries The National Map, rejects newer project tiles that
+operational area. It queries The National Map, rejects newer project tiles that
 contain no data for the requested area, downloads the newest usable GeoTIFF,
 records the API response, source CRS, file size, and SHA-256, then builds the
 regional quantized-mesh levels. Source elevation values are preserved; the tool
@@ -44,6 +44,11 @@ records USGS NAVD88 metadata but does not perform a vertical conversion.
     --min-zoom 13 --max-zoom 18 \
     --out /data/terrain/site-name --jobs 4
 ```
+
+By default the tool expands the bounding box into the same per-level footprint
+used by Map3D's fine radius of two tiles and coarser ring width of one. The
+prepared source bounds and exact tile counts are recorded in `region.json`.
+Use `--fine-radius` and `--lod-ring` only when Map3D uses matching values.
 
 The output contains `region.json`, `terrain/layer.json`, `_source.tif`, the downloaded
 source GeoTIFFs under `sources/`, and `terrain/{z}/{x}/{y}.terrain`. A `.incomplete`

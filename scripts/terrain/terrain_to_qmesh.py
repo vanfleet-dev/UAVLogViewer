@@ -46,6 +46,89 @@ def validate_bbox(bbox):
     return [float(value) for value in bbox]
 
 
+def lod_tile_set(z_fine, fx0, fx1, fy0, fy1, z_min, ring):
+    """Match Map3D's nested fine patch and coarser LOD rings."""
+    keys = set((z_fine, x, y)
+               for x in range(fx0, fx1 + 1)
+               for y in range(fy0, fy1 + 1))
+    hx0, hx1, hy0, hy1 = fx0, fx1, fy0, fy1
+    zoom = z_fine
+    while zoom - 1 >= z_min:
+        zoom -= 1
+        skip_x0, skip_x1 = (hx0 + 1) // 2, (hx1 - 1) // 2
+        skip_y0, skip_y1 = (hy0 + 1) // 2, (hy1 - 1) // 2
+        outer_x0, outer_x1 = hx0 // 2 - ring, hx1 // 2 + ring
+        outer_y0, outer_y1 = hy0 // 2 - ring, hy1 // 2 + ring
+        for x in range(outer_x0, outer_x1 + 1):
+            for y in range(outer_y0, outer_y1 + 1):
+                if skip_x0 <= x <= skip_x1 and skip_y0 <= y <= skip_y1:
+                    continue
+                keys.add((zoom, x, y))
+        hx0, hx1 = outer_x0, outer_x1
+        hy0, hy1 = outer_y0, outer_y1
+    return keys
+
+
+def build_lod_worklist(bbox, minzoom, maxzoom, fine_radius, ring,
+                       max_focus_tiles):
+    focus_x0, focus_x1, focus_y0, focus_y1 = qmesh.tile_range_for_bbox(
+        maxzoom, *bbox)
+    focus_count = ((focus_x1 - focus_x0 + 1) *
+                   (focus_y1 - focus_y0 + 1))
+    if focus_count > max_focus_tiles:
+        raise RuntimeError(
+            '%d focus tiles exceed --max-focus-tiles %d' %
+            (focus_count, max_focus_tiles))
+    keys = set()
+    for focus_x in range(focus_x0, focus_x1 + 1):
+        for focus_y in range(focus_y0, focus_y1 + 1):
+            keys.update(lod_tile_set(
+                maxzoom,
+                focus_x - fine_radius, focus_x + fine_radius,
+                focus_y - fine_radius, focus_y + fine_radius,
+                minzoom, ring))
+    normalized = set()
+    for zoom, x, y in keys:
+        limit = 1 << zoom
+        if 0 <= y < limit:
+            normalized.add((zoom, x % limit, y))
+    ordered = sorted(normalized)
+    per_level = {zoom: [] for zoom in range(minzoom, maxzoom + 1)}
+    packed = []
+    for zoom, x, y in ordered:
+        per_level[zoom].append((x, y))
+        packed.append(qmesh.pack_key(zoom, x, y))
+    return np.asarray(packed, dtype=np.int64), per_level, focus_count
+
+
+def worklist_bounds(keys):
+    west, south, east, north = 180.0, 90.0, -180.0, -90.0
+    for packed in keys:
+        zoom, x, y = qmesh._decode_key(packed)
+        tile_west, tile_south, tile_east, tile_north = qmesh.tile_bounds(
+            zoom, x, y)
+        west = min(west, tile_west)
+        south = min(south, tile_south)
+        east = max(east, tile_east)
+        north = max(north, tile_north)
+    return [west, south, east, north]
+
+
+def sampling_bounds(prepared_bounds, minzoom, grid):
+    """Add one sample of margin around the edge-aligned regular mesh read."""
+    if grid <= 1:
+        return list(prepared_bounds)
+    tiles = 1 << minzoom
+    lon_margin = 360.0 / tiles / (grid - 1)
+    lat_margin = 180.0 / tiles / (grid - 1)
+    return [
+        max(-180.0, prepared_bounds[0] - lon_margin),
+        max(-90.0, prepared_bounds[1] - lat_margin),
+        min(180.0, prepared_bounds[2] + lon_margin),
+        min(90.0, prepared_bounds[3] + lat_margin),
+    ]
+
+
 def product_key(product):
     match = TILE_NAME_RE.search(product.get('title', ''))
     if match:
@@ -250,9 +333,11 @@ def mosaic_valid_fraction(path, bbox):
 
 
 def render_tiles(source_path, out_dir, bbox, minzoom, maxzoom, jobs, grid,
-                 max_error, tile_px, force):
-    keys, _expected = qmesh.build_worklist_for_bbox(
-        bbox, minzoom, maxzoom, want_levels=False)
+                 max_error, tile_px, force, worklist=None):
+    keys = worklist
+    if keys is None:
+        keys, _expected = qmesh.build_worklist_for_bbox(
+            bbox, minzoom, maxzoom, want_levels=False)
     total = len(keys)
     if total == 0:
         raise RuntimeError('bbox produced no terrain tiles')
@@ -290,6 +375,10 @@ def prepare(args):
     bbox = validate_bbox(args.bbox)
     if args.min_zoom < 0 or args.max_zoom > 19 or args.min_zoom > args.max_zoom:
         raise ValueError('zoom range must satisfy 0 <= MIN <= MAX <= 19')
+    if args.fine_radius < 0 or args.lod_ring < 0:
+        raise ValueError('fine radius and LOD ring must be non-negative')
+    if args.max_focus_tiles < 1:
+        raise ValueError('max focus tiles must be positive')
 
     package_dir = Path(args.out).resolve()
     terrain_dir = package_dir / 'terrain'
@@ -316,10 +405,26 @@ def prepare(args):
         'sourceRasters': [],
     }
 
+    worklist, expected_tiles, focus_count = build_lod_worklist(
+        bbox, args.min_zoom, args.max_zoom, args.fine_radius,
+        args.lod_ring, args.max_focus_tiles)
+    prepared_bounds = worklist_bounds(worklist)
+    mosaic_bounds = sampling_bounds(prepared_bounds, args.min_zoom, args.grid)
+    manifest['preparedBounds'] = prepared_bounds
+    manifest['mosaicBounds'] = mosaic_bounds
+    manifest['lodPolicy'] = {
+        'fineRadius': args.fine_radius,
+        'ring': args.lod_ring,
+        'localHandoffZoom': args.min_zoom,
+        'focusTileCount': focus_count,
+        'expectedTileCounts': {
+            str(zoom): len(expected_tiles[zoom]) for zoom in expected_tiles},
+    }
+
     if args.usgs_1m:
-        products, query_url = query_usgs_products(bbox)
+        products, query_url = query_usgs_products(mosaic_bounds)
         if not products:
-            raise RuntimeError('USGS has no 1 m GeoTIFF products for this bbox')
+            raise RuntimeError('USGS has no 1 m GeoTIFF products for the prepared bounds')
         if len(products) > args.max_products:
             raise RuntimeError('%d USGS tiles exceed --max-products %d' %
                                (len(products), args.max_products))
@@ -340,27 +445,22 @@ def prepare(args):
             raise RuntimeError('source raster not found: %s' % source_path)
         source_paths = [source_path]
 
-    x0, x1, y0, y1 = qmesh.tile_range_for_bbox(args.max_zoom, *bbox)
-    first_bounds = qmesh.tile_bounds(args.max_zoom, x0, y0)
-    last_bounds = qmesh.tile_bounds(args.max_zoom, x1, y1)
-    mosaic_bounds = [first_bounds[0], first_bounds[1],
-                     last_bounds[2], last_bounds[3]]
-    manifest['preparedBounds'] = mosaic_bounds
     mosaic_path = package_dir / '_source.tif'
     source_records, mosaic_record = build_mosaic(
         source_paths, mosaic_path, mosaic_bounds)
     manifest['sourceRasters'] = source_records
     manifest['mosaic'] = mosaic_record
-    valid_fraction = mosaic_valid_fraction(mosaic_path, bbox)
-    manifest['mosaic']['requestedBoundsValidFraction'] = valid_fraction
+    valid_fraction = mosaic_valid_fraction(mosaic_path, prepared_bounds)
+    manifest['mosaic']['preparedBoundsValidFraction'] = valid_fraction
     if valid_fraction < 0.99:
         atomic_json(package_dir / 'region.json', manifest)
         raise RuntimeError(
-            'source data covers only %.1f%% of the requested bbox; choose a smaller '
+            'source data covers only %.1f%% of the prepared bounds; choose a smaller '
             'zone or another source raster' % (100.0 * valid_fraction))
     per_level, counts = render_tiles(
         mosaic_path, terrain_dir, bbox, args.min_zoom, args.max_zoom,
-        args.jobs, args.grid, args.max_error, args.tile_px, args.force)
+        args.jobs, args.grid, args.max_error, args.tile_px, args.force,
+        worklist=worklist)
     manifest['terrain'] = {
         'path': 'terrain/layer.json',
         'minZoom': args.min_zoom,
@@ -374,11 +474,13 @@ def prepare(args):
         'elevationReference': manifest['elevationReference'],
         'sourceManifest': '../region.json',
         'sourceCRS': [record['crs'] for record in source_records],
+        'localHandoffZoom': args.min_zoom,
+        'lodPolicy': manifest['lodPolicy'],
         'tileCounts': {str(zoom): len(per_level[zoom]) for zoom in per_level},
     }
     qmesh.write_layer_json(
         terrain_dir, args.max_zoom, per_level, args.min_zoom,
-        bounds=bbox, output_minzoom=args.min_zoom, metadata=metadata,
+        bounds=prepared_bounds, output_minzoom=args.min_zoom, metadata=metadata,
         merge_existing=False)
     incomplete.unlink(missing_ok=True)
     print('complete: %s (%s)' % (package_dir, counts), flush=True)
@@ -399,6 +501,12 @@ def parse_args(argv=None):
     parser.add_argument('--grid', type=int, default=65)
     parser.add_argument('--tile-px', type=int, default=256)
     parser.add_argument('--max-error', type=float, default=4.0)
+    parser.add_argument('--fine-radius', type=int, default=2,
+                        help='Map3D fine-tile radius around each focus tile')
+    parser.add_argument('--lod-ring', type=int, default=1,
+                        help='Map3D coarser-ring width')
+    parser.add_argument('--max-focus-tiles', type=int, default=100000,
+                        help='abort when the operational AOI has more focus tiles')
     parser.add_argument('--max-products', type=int, default=100,
                         help='abort before downloading more than this many USGS tiles')
     parser.add_argument('--elevation-reference', default='source values; no vertical conversion')

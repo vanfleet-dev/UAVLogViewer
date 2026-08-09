@@ -201,7 +201,9 @@ def render_tile(zxy):
         rr, cc = np.mgrid[0:g, 0:g]
         lon = west + cc.ravel() * sx
         lat = north - rr.ravel() * sy
-        pos = np.column_stack([lon, lat, arr.ravel()]).astype(np.float32)
+        # Keep geographic coordinates in float64. At zoom 18/19, float32
+        # longitude can collapse adjacent vertices and produce zero normals.
+        pos = np.column_stack([lon, lat, arr.ravel()])
         idx = _GRID_IDX
     else:
         # Adaptive Delatin mesh, with the read clamped to the data extent so low-zoom
@@ -238,7 +240,7 @@ def render_tile(zxy):
         W, H = ow, oh
         lon = west + verts[:, 0] / (W - 1) * (east - west)
         lat = north - verts[:, 1] / (H - 1) * (north - south)
-        pos = np.column_stack([lon, lat, verts[:, 2]]).astype(np.float32)
+        pos = np.column_stack([lon, lat, verts[:, 2]])
         idx = tris.astype(np.uint32)
     ext = VertexNormalsExtension(indices=idx, positions=pos)
     buf = io.BytesIO()
@@ -261,6 +263,10 @@ def render_tile(zxy):
 _KEY_ZSH = 40
 _KEY_XSH = 20
 _KEY_MASK = (1 << 20) - 1
+
+
+def pack_key(z, x, y):
+    return (int(z) << _KEY_ZSH) | (int(x) << _KEY_XSH) | int(y)
 
 
 def _decode_key(k):

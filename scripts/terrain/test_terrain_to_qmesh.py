@@ -99,13 +99,45 @@ def test_rejects_invalid_bbox_order():
         terrain.validate_bbox([-105.0, 40.0, -106.0, 41.0])
 
 
+def test_lod_worklist_matches_default_map3d_footprint():
+    bbox = [-105.2751, 39.9949, -105.2750, 39.9950]
+
+    keys, per_level, focus_count = terrain.build_lod_worklist(
+        bbox, 13, 18, fine_radius=2, ring=1, max_focus_tiles=100)
+
+    assert focus_count == 1
+    assert len(keys) == 130
+    assert [len(per_level[zoom]) for zoom in range(13, 19)] == [21, 21, 21, 21, 21, 25]
+    for zoom in (13, 18):
+        xs = [x for x, _y in per_level[zoom]]
+        ys = [y for _x, y in per_level[zoom]]
+        assert max(xs) - min(xs) + 1 == 5
+        assert max(ys) - min(ys) + 1 == 5
+
+
+def test_lod_worklist_does_not_fill_coarse_bounds_at_fine_zoom():
+    bbox = list(qmesh.tile_bounds(18, 108825, 189318))
+    bbox[2] = qmesh.tile_bounds(18, 108826, 189318)[2]
+
+    keys, per_level, _focus_count = terrain.build_lod_worklist(
+        bbox, 13, 18, fine_radius=2, ring=1, max_focus_tiles=100)
+    prepared = terrain.worklist_bounds(keys)
+    x0, x1, y0, y1 = qmesh.tile_range_for_bbox(18, *prepared)
+    full_rectangle_count = (x1 - x0 + 1) * (y1 - y0 + 1)
+
+    assert len(per_level[18]) < full_rectangle_count // 100
+
+
 def test_local_raster_build_publishes_regional_package(tmp_path):
     source = tmp_path / 'source.tif'
     bbox = [-105.001, 39.999, -104.999, 40.001]
+    x0, _x1, y0, _y1 = qmesh.tile_range_for_bbox(13, *bbox)
+    source_bounds = terrain.sampling_bounds(
+        qmesh.tile_bounds(13, x0, y0), 13, 65)
     with rasterio.open(
             source, 'w', driver='GTiff', width=256, height=256, count=1,
             dtype='float32', crs='EPSG:4326', nodata=-32768.0,
-            transform=from_bounds(*bbox, 256, 256)) as dataset:
+            transform=from_bounds(*source_bounds, 256, 256)) as dataset:
         dataset.write(np.full((256, 256), 1234.5, dtype=np.float32), 1)
     package = tmp_path / 'package'
     args = terrain.parse_args([
@@ -113,6 +145,7 @@ def test_local_raster_build_publishes_regional_package(tmp_path):
         '--bbox', *(str(value) for value in bbox),
         '--min-zoom', '13', '--max-zoom', '13',
         '--out', str(package), '--jobs', '1',
+        '--fine-radius', '0', '--lod-ring', '0',
     ])
 
     terrain.prepare(args)
@@ -121,6 +154,8 @@ def test_local_raster_build_publishes_regional_package(tmp_path):
     assert region['schemaVersion'] == 1
     assert region['terrain']['path'] == 'terrain/layer.json'
     assert region['terrain']['renderCounts']['ok'] == 1
+    assert region['lodPolicy']['fineRadius'] == 0
+    assert region['lodPolicy']['localHandoffZoom'] == 13
     assert (package / 'terrain' / 'layer.json').is_file()
     assert len(list((package / 'terrain' / '13').glob('*/*.terrain'))) == 1
     assert not (package / '.incomplete').exists()
