@@ -180,6 +180,8 @@ def render_tile(zxy):
     # Low zoom reads the coarse global DEM (cheap, has overviews); high zoom reads
     # full-res SRTM (each tile then covers only ~1 cell, so the window is bounded).
     ds = _DS_COARSE if (_DS_COARSE is not None and z <= _COARSE_MAXZ) else _DS
+    if ds is None:
+        raise RuntimeError('terrain worker has no open DEM')
     west, south, east, north = tile_bounds(z, x, y)
 
     if _GRID > 0:
@@ -194,10 +196,15 @@ def render_tile(zxy):
         # data extent (coverage edges); interior tiles read directly (~12x faster).
         db = ds.bounds
         inside = ew >= db.left and es >= db.bottom and ee <= db.right and en <= db.top
-        arr = ds.read(1, window=from_bounds(ew, es, ee, en, ds.transform),
-                      out_shape=(g, g), resampling=Resampling.bilinear,
-                      boundless=not inside, fill_value=0).astype(np.float32)
-        arr[arr < -1000.0] = 0.0
+        sampled = ds.read(
+            1, window=from_bounds(ew, es, ee, en, ds.transform),
+            out_shape=(g, g), resampling=Resampling.bilinear,
+            boundless=not inside, masked=True)
+        if np.ma.getmaskarray(sampled).any():
+            return 'empty'
+        arr = np.asarray(sampled.data, dtype=np.float32)
+        if not np.isfinite(arr).all():
+            return 'empty'
         rr, cc = np.mgrid[0:g, 0:g]
         lon = west + cc.ravel() * sx
         lat = north - rr.ravel() * sy
@@ -213,6 +220,8 @@ def render_tile(zxy):
         isb, itn = max(south, db.bottom), min(north, db.top)
         if ie <= iw or itn <= isb:
             return 'empty'  # tile doesn't overlap any source data
+        if iw > west or ie < east or isb > south or itn < north:
+            return 'empty'  # do not publish a partially covered tile
         resx, resy = ds.res
         ow = max(2, min(int(round((east - west) / resx)) + 1, _TILE_PX))
         oh = max(2, min(int(round((north - south) / resy)) + 1, _TILE_PX))
@@ -228,10 +237,15 @@ def render_tile(zxy):
         be = west + cx1 / (ow - 1) * (east - west)
         bn = north - ry0 / (oh - 1) * (north - south)
         bs = north - ry1 / (oh - 1) * (north - south)
-        sub = ds.read(1, window=from_bounds(bw, bs, be, bn, ds.transform),
-                      out_shape=(sh, sw), resampling=Resampling.bilinear,
-                      boundless=True, fill_value=0).astype(np.float32)
-        sub[sub < -1000.0] = 0.0
+        sampled = ds.read(
+            1, window=from_bounds(bw, bs, be, bn, ds.transform),
+            out_shape=(sh, sw), resampling=Resampling.bilinear,
+            boundless=False, masked=True)
+        if np.ma.getmaskarray(sampled).any():
+            return 'empty'
+        sub = np.asarray(sampled.data, dtype=np.float32)
+        if not np.isfinite(sub).all():
+            return 'empty'
         arr[ry0:ry0 + sh, cx0:cx0 + sw] = sub
         tin = Delatin(arr, max_error=_MAX_ERROR)
         verts, tris = tin.vertices, tin.triangles

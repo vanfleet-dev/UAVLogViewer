@@ -1,4 +1,6 @@
+import gzip
 import json
+import struct
 import sys
 from pathlib import Path
 
@@ -128,7 +130,8 @@ def test_lod_worklist_does_not_fill_coarse_bounds_at_fine_zoom():
     assert len(per_level[18]) < full_rectangle_count // 100
 
 
-def test_local_raster_build_publishes_regional_package(tmp_path):
+@pytest.mark.parametrize('height', [1234.5, -1200.25])
+def test_local_raster_build_preserves_valid_heights(tmp_path, height):
     source = tmp_path / 'source.tif'
     bbox = [-105.001, 39.999, -104.999, 40.001]
     x0, _x1, y0, _y1 = qmesh.tile_range_for_bbox(13, *bbox)
@@ -138,7 +141,7 @@ def test_local_raster_build_publishes_regional_package(tmp_path):
             source, 'w', driver='GTiff', width=256, height=256, count=1,
             dtype='float32', crs='EPSG:4326', nodata=-32768.0,
             transform=from_bounds(*source_bounds, 256, 256)) as dataset:
-        dataset.write(np.full((256, 256), 1234.5, dtype=np.float32), 1)
+        dataset.write(np.full((256, 256), height, dtype=np.float32), 1)
     package = tmp_path / 'package'
     args = terrain.parse_args([
         '--source-raster', str(source),
@@ -157,8 +160,33 @@ def test_local_raster_build_publishes_regional_package(tmp_path):
     assert region['lodPolicy']['fineRadius'] == 0
     assert region['lodPolicy']['localHandoffZoom'] == 13
     assert (package / 'terrain' / 'layer.json').is_file()
-    assert len(list((package / 'terrain' / '13').glob('*/*.terrain'))) == 1
+    terrain_files = list((package / 'terrain' / '13').glob('*/*.terrain'))
+    assert len(terrain_files) == 1
+    payload = gzip.decompress(terrain_files[0].read_bytes())
+    minimum, maximum = struct.unpack_from('<ff', payload, 24)
+    assert minimum == pytest.approx(height, abs=0.01)
+    assert maximum == pytest.approx(height, abs=0.01)
     assert not (package / '.incomplete').exists()
+
+
+def test_local_raster_rejects_uncovered_emitted_tile(tmp_path):
+    source = tmp_path / 'source.tif'
+    bbox = [-105.001, 39.999, -104.999, 40.001]
+    with rasterio.open(
+            source, 'w', driver='GTiff', width=100, height=100, count=1,
+            dtype='float32', crs='EPSG:4326', nodata=-32768.0,
+            transform=from_bounds(*bbox, 100, 100)) as dataset:
+        dataset.write(np.full((100, 100), 1234.0, dtype=np.float32), 1)
+    args = terrain.parse_args([
+        '--source-raster', str(source),
+        '--bbox', *(str(value) for value in bbox),
+        '--min-zoom', '13', '--max-zoom', '13',
+        '--out', str(tmp_path / 'package'), '--jobs', '1',
+        '--fine-radius', '0', '--lod-ring', '0',
+    ])
+
+    with pytest.raises(RuntimeError, match='covers only .* prepared bounds'):
+        terrain.prepare(args)
 
 
 def _product(title, publication_date, url, size):

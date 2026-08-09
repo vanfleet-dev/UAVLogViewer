@@ -399,7 +399,9 @@ def prepare(args):
         'elevationReference': (USGS_ELEVATION_REFERENCE if args.usgs_1m
                                else args.elevation_reference),
         'verticalValuesTransformed': False,
-        'nodataPolicy': 'refuse package when sampled AOI validity is below 99 percent',
+        'nodataPolicy': (
+            'reject package when sampled prepared-bounds validity is below 99 percent; '
+            'omit emitted tiles containing declared nodata or non-finite samples'),
         'productsQuery': None,
         'products': [],
         'sourceRasters': [],
